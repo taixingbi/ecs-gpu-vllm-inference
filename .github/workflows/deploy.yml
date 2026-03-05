@@ -1,4 +1,4 @@
-name: Deploy vLLM to EC2
+name: Deploy vLLM to ECS
 
 on:
   push:
@@ -15,15 +15,35 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     outputs:
-      elastic_ip: ${{ steps.eip.outputs.elastic_ip }}
+      endpoint: ${{ steps.endpoint.outputs.endpoint }}
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create ECS cluster
+        id: cluster
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ vars.ECS_CLUSTER || 'vllm-cluster' }}"
+          if aws ecs describe-clusters --clusters "$CLUSTER" --region $REGION --query 'clusters[0].status' --output text 2>/dev/null | grep -q ACTIVE; then
+            echo "Cluster $CLUSTER exists"
+          else
+            aws ecs create-cluster --cluster-name "$CLUSTER" --region $REGION
+            echo "Created cluster $CLUSTER"
+          fi
+          echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+
+      - name: Create CloudWatch log group
+        run: |
+          aws logs create-log-group --log-group-name /ecs/vllm-qwen --region ${{ env.AWS_REGION }} 2>/dev/null || true
 
       - name: Resolve security group
         id: sg
@@ -44,6 +64,7 @@ jobs:
         id: ec2
         run: |
           REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ steps.cluster.outputs.cluster }}"
           INSTANCE_NAME="ecs-gpu-vllm-inference"
           SG_ID="${{ steps.sg.outputs.group_id }}"
           EXISTING=$(aws ec2 describe-instances \
@@ -85,17 +106,15 @@ jobs:
               --block-device-mappings "[{\"DeviceName\":\"/dev/xvda\",\"Ebs\":{\"VolumeSize\":$ROOT_GB,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
               $EXTRA_ARGS \
               --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME},{Key=workflow,Value=deploy}]" \
-              --user-data '#!/bin/bash
-            echo ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config 2>/dev/null || true
-            yum install -y docker || true
-            systemctl start docker 2>/dev/null || true
-            usermod -aG docker ec2-user 2>/dev/null || true
-            distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-            curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.repo | tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+              --user-data "#!/bin/bash
+            echo ECS_CLUSTER=$CLUSTER >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config
+            distribution=\$(. /etc/os-release;echo \$ID\$VERSION_ID)
+            curl -s -L https://nvidia.github.io/libnvidia-container/\$distribution/libnvidia-container.repo | tee /etc/yum.repos.d/nvidia-container-toolkit.repo
             yum install -y nvidia-container-toolkit
             nvidia-ctk runtime configure --runtime=docker
             systemctl restart docker
-            ' \
+            " \
               --region $REGION \
               --query 'Instances[0].InstanceId' --output text)
             echo "created=true" >> $GITHUB_OUTPUT
@@ -106,21 +125,16 @@ jobs:
         run: |
           aws ec2 wait instance-running --instance-ids ${{ steps.ec2.outputs.instance_id }} --region ${{ env.AWS_REGION }}
 
-      - name: Get instance IP
-        id: eip
+      - name: Get instance subnet and EIP
+        id: net
         run: |
           INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
           REGION="${{ env.AWS_REGION }}"
           CREATED="${{ steps.ec2.outputs.created }}"
-          EIP=""
+          SUBNET=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].SubnetId' --output text)
+          echo "subnet=$SUBNET" >> $GITHUB_OUTPUT
           if [ "$CREATED" = "false" ]; then
-            echo "Reusing instance, getting existing IP"
-            sleep 5
             EIP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-            if [ -z "$EIP" ] || [ "$EIP" = "None" ]; then
-              echo "Instance has no public IP. Associate an EIP manually or set EC2_ELASTIC_IP_ALLOCATION_ID."
-              exit 1
-            fi
           elif [ -n "${{ vars.EC2_ELASTIC_IP_ALLOCATION_ID }}" ]; then
             ALLOC_ID="${{ vars.EC2_ELASTIC_IP_ALLOCATION_ID }}"
             ASSOC_ID=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region $REGION --query 'Addresses[0].AssociationId' --output text 2>/dev/null || echo "")
@@ -135,89 +149,118 @@ jobs:
               aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $ALLOC_ID --region $REGION
               EIP=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region $REGION --query 'Addresses[0].PublicIp' --output text)
             else
-              echo "EIP limit reached, using instance public IP"
               sleep 10
               EIP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-              if [ -z "$EIP" ] || [ "$EIP" = "None" ]; then
-                echo "No public IP. Launch instance in a public subnet or set EC2_ELASTIC_IP_ALLOCATION_ID."
-                exit 1
-              fi
             fi
           fi
           echo "elastic_ip=$EIP" >> $GITHUB_OUTPUT
 
-      - name: Wait for SSM
+      - name: Wait for EC2 to register with ECS cluster
         run: |
-          INSTANCE_ID=${{ steps.ec2.outputs.instance_id }}
-          REGION=${{ env.AWS_REGION }}
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ steps.cluster.outputs.cluster }}"
+          INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
           for i in {1..30}; do
-            if aws ssm describe-instance-information \
-              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-              --region $REGION \
-              --query 'InstanceInformationList[0].InstanceId' --output text 2>/dev/null | grep -q "$INSTANCE_ID"; then
-              echo "SSM ready"
-              break
-            fi
-            echo "Waiting for SSM... ($i/30)"
-            sleep 10
+            for ARN in $(aws ecs list-container-instances --cluster $CLUSTER --region $REGION --query 'containerInstanceArns[]' --output text 2>/dev/null); do
+              [ -z "$ARN" ] && continue
+              EC2_ID=$(aws ecs describe-container-instances --cluster $CLUSTER --container-instances $ARN --region $REGION --query 'containerInstances[0].ec2InstanceId' --output text 2>/dev/null || echo "")
+              if [ "$EC2_ID" = "$INSTANCE_ID" ]; then
+                STATUS=$(aws ecs describe-container-instances --cluster $CLUSTER --container-instances $ARN --region $REGION --query 'containerInstances[0].status' --output text)
+                if [ "$STATUS" = "ACTIVE" ]; then
+                  echo "Instance registered with cluster"
+                  exit 0
+                fi
+              fi
+            done
+            echo "Waiting for ECS registration... ($i/30)"
+            sleep 20
           done
-          sleep 15
+          echo "Timeout: instance did not register with cluster. Ensure IAM profile has AmazonEC2ContainerServiceforEC2Role."
+          exit 1
 
-      - name: Pull vLLM image via SSM
+      - name: Register task definition
+        id: taskdef
         run: |
-          INSTANCE_ID=${{ steps.ec2.outputs.instance_id }}
-          REGION=${{ env.AWS_REGION }}
-          CMD_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters '{"commands":["docker pull ${{ env.VLLM_IMAGE }}"]}' \
-            --timeout-seconds 2400 \
-            --region $REGION \
-            --query 'Command.CommandId' --output text)
-          for i in {1..180}; do
-            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region $REGION --query 'Status' --output text 2>/dev/null || echo "Pending")
-            if [ "$STATUS" = "Success" ]; then
-              echo "Image pull succeeded"
-              break
-            fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
-              echo "Image pull failed: $STATUS"
-              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region $REGION
-              exit 1
-            fi
-            echo "Pulling image... ($i/180)"
-            sleep 10
+          REGION="${{ env.AWS_REGION }}"
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          TASK_JSON=$(jq \
+            --arg img "${{ env.VLLM_IMAGE }}" \
+            --arg model "${{ env.INFER_MODEL }}" \
+            --arg role "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole" \
+            --arg region "$REGION" \
+            '.containerDefinitions[0].image = $img | .containerDefinitions[0].command = ["--model", $model] | .executionRoleArn = $role | .containerDefinitions[0].logConfiguration.options["awslogs-region"] = $region' \
+            ecs/task-definition.json)
+          TASK_ARN=$(echo "$TASK_JSON" | aws ecs register-task-definition --cli-input-json file:///dev/stdin --region $REGION --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+
+      - name: Stop existing vLLM tasks
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ steps.cluster.outputs.cluster }}"
+          TASK_DEF="${{ vars.ECS_TASK_DEFINITION || 'vllm-qwen' }}"
+          for ARN in $(aws ecs list-tasks --cluster $CLUSTER --family $TASK_DEF --desired-status RUNNING --region $REGION --query 'taskArns[]' --output text 2>/dev/null); do
+            [ -n "$ARN" ] && [ "$ARN" != "None" ] && aws ecs stop-task --cluster $CLUSTER --task $ARN --region $REGION --query 'task.taskArn' --output text
           done
+          sleep 10
 
-      - name: Deploy vLLM via SSM
+      - name: Run ECS task
+        id: task
+        env:
+          HF_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
         run: |
-          INSTANCE_ID=${{ steps.ec2.outputs.instance_id }}
-          REGION=${{ env.AWS_REGION }}
-          CMD_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters '{"commands":["docker rm -f vllm 2>/dev/null || true","docker run -d --name vllm --gpus all --shm-size 4g -p 8000:8000 -e HF_TOKEN=${{ secrets.HUGGING_FACE_HUB_TOKEN }} ${{ env.VLLM_IMAGE }} --model ${{ env.INFER_MODEL }}"]}' \
-            --timeout-seconds 600 \
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ steps.cluster.outputs.cluster }}"
+          TASK_DEF="${{ steps.taskdef.outputs.task_arn }}"
+          SUBNET="${{ steps.net.outputs.subnet }}"
+          SG_ID="${{ steps.sg.outputs.group_id }}"
+          if [ -n "$HF_TOKEN" ]; then
+            OVERRIDES=$(jq -n --arg t "$HF_TOKEN" '{containerOverrides:[{name:"vllm",environment:[{name:"HUGGING_FACE_HUB_TOKEN",value:$t}]}]}')
+          else
+            OVERRIDES='{}'
+          fi
+          TASK_ARN=$(aws ecs run-task \
+            --cluster $CLUSTER \
+            --task-definition $TASK_DEF \
+            --launch-type EC2 \
+            --network-configuration "awsvpcConfiguration={subnets=[\"$SUBNET\"],securityGroups=[\"$SG_ID\"],assignPublicIp=ENABLED}" \
+            --overrides "$OVERRIDES" \
             --region $REGION \
-            --query 'Command.CommandId' --output text)
+            --query 'tasks[0].taskArn' --output text)
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+
+      - name: Wait for task and get endpoint
+        id: endpoint
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ steps.cluster.outputs.cluster }}"
+          TASK_ARN="${{ steps.task.outputs.task_arn }}"
           for i in {1..60}; do
-            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region $REGION --query 'Status' --output text 2>/dev/null || echo "Pending")
-            if [ "$STATUS" = "Success" ]; then
-              echo "Deploy succeeded"
+            STATUS=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --region $REGION --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo "PENDING")
+            if [ "$STATUS" = "RUNNING" ]; then
+              ENI=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --region $REGION --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text)
+              IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --region $REGION --query 'NetworkInterfaces[0].Association.PublicIp' --output text 2>/dev/null || echo "")
+              if [ -z "$IP" ] || [ "$IP" = "None" ]; then
+                IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --region $REGION --query 'NetworkInterfaces[0].PrivateIpAddress' --output text)
+              fi
+              echo "endpoint=$IP" >> $GITHUB_OUTPUT
+              echo "Task running at $IP:8000"
               exit 0
             fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
-              echo "Deploy failed: $STATUS"
-              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region $REGION
+            if [ "$STATUS" = "STOPPED" ]; then
+              echo "Task stopped unexpectedly"
+              aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --region $REGION
               exit 1
             fi
-            echo "Waiting for command... ($i/60)"
+            echo "Waiting for task... ($i/60)"
             sleep 10
           done
-          echo "Timeout waiting for SSM command"
+          echo "Timeout waiting for task"
           exit 1
 
       - name: Output
         run: |
-          echo "Elastic IP: ${{ steps.eip.outputs.elastic_ip }}"
-          echo "Test: curl http://${{ steps.eip.outputs.elastic_ip }}:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"Qwen/Qwen2.5-7B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'"
+          ENDPOINT="${{ steps.endpoint.outputs.endpoint }}"
+          EIP="${{ steps.net.outputs.elastic_ip }}"
+          echo "Task endpoint: http://$ENDPOINT:8000"
+          echo "Instance EIP (fallback): http://$EIP:8000"
+          echo "Test: curl http://$ENDPOINT:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"Qwen/Qwen2.5-7B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'"

@@ -2,8 +2,8 @@
 
 Deploy [vLLM](https://github.com/vllm-project/vllm) with Qwen/Qwen2.5-7B-Instruct in two ways:
 
-- **AWS ECS** – EC2 launch type with GPU (recommended for containerized deployments)
-- **EC2** – Direct g5.xlarge via GitHub Actions
+- **GitHub Actions** – Deploys to ECS cluster with EC2 GPU instance (recommended)
+- **Manual ECS** – Use `ecs/run-task.sh` for manual deployment
 
 See [plan.md](plan.md) for the ECS architecture and design.
 
@@ -32,18 +32,19 @@ Replace `EC2_IP` with the Elastic IP, ECS task IP, or `localhost` for local Dock
 | `AWS_AMI_ID` | GPU AMI (optional; auto-resolved if unset) |
 | `AWS_REGION` | Region (default: `us-east-1`) |
 | `AWS_SECURITY_GROUP_ID` | SG ID (sg-xxx) or name (default: `ec2`) with inbound 8000 |
-| `EC2_IAM_INSTANCE_PROFILE` | IAM instance profile for SSM (default: `ec2-ssm-role`); must have `AmazonSSMManagedInstanceCore` |
+| `ECS_CLUSTER` | ECS cluster name (default: `vllm-cluster`) |
+| `EC2_IAM_INSTANCE_PROFILE` | IAM instance profile (default: `ec2-ssm-role`); must have `AmazonEC2ContainerServiceforEC2Role` for ECS |
 | `EC2_ROOT_VOLUME_SIZE` | Root EBS volume size in GB (default: `100`; vLLM image + model need ~50GB+) |
 | `EC2_KEY_PAIR` | SSH key name (optional; only needed for manual SSH) |
 | `EC2_ELASTIC_IP_ALLOCATION_ID` | Reuse existing EIP (avoids AddressLimitExceeded; e.g. `eipalloc-xxx`) |
-| `EC2_SUBNET_ID` | Public subnet for auto public IP when EIP limit reached (optional) |
+| `EC2_SUBNET_ID` | Subnet for EC2 instance (optional; must be public for task public IP) |
 | `EC2_INSTANCE_TYPE` | GPU instance (default: `g5.xlarge`). Use `g4dn.xlarge` if vCPU limit exceeded |
 
 ### Repo secrets
 
 | Secret | Description |
 |--------|-------------|
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | AWS credentials (IAM user needs `ssm:SendCommand`, `ssm:GetCommandInvocation`) |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | AWS credentials (IAM user needs ECS, EC2, SSM permissions) |
 | `HUGGING_FACE_HUB_TOKEN` | Optional; for gated models |
 
 ### Model (deploy/.env)
@@ -69,9 +70,9 @@ Models cached in the `models` volume (`/root/.cache/huggingface`).
 
 ## Deploy (EC2 via GitHub Actions)
 
-Push to `qa` or run the workflow manually. Steps: create g5.xlarge with ECS GPU AMI → attach EIP → deploy vLLM via SSM (no SSH keys required). The EC2 instance must use an IAM instance profile with `AmazonSSMManagedInstanceCore`; the GitHub Actions IAM user needs `ssm:SendCommand` and `ssm:GetCommandInvocation`.
+Push to `qa` or run the workflow manually. Steps: create ECS cluster → create/start g5.xlarge with ECS GPU AMI → register EC2 with cluster → register task definition → run vLLM task. The EC2 instance needs IAM profile with `AmazonEC2ContainerServiceforEC2Role`; you must have `ecsTaskExecutionRole` for the task. The workflow creates the CloudWatch log group `/ecs/vllm-qwen` if missing.
 
-**Existing instances:** If you have an instance created before the SSM migration, attach the IAM instance profile (`ec2-ssm-role`) to it, or delete it and let the workflow create a new one. You can remove the `EC2_SSH_KEY` secret from GitHub. If you see "no space left on device", delete the instance so a new one is created with a 100GB root volume (`EC2_ROOT_VOLUME_SIZE`).
+**Existing instances:** If you have an instance from the previous direct-EC2 setup, delete it so a new one is created with ECS cluster in user-data. The instance must register with the cluster to run tasks.
 
 ---
 
