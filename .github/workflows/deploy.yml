@@ -268,7 +268,7 @@ jobs:
             --cluster $CLUSTER \
             --task-definition $TASK_DEF \
             --launch-type EC2 \
-            --network-configuration "awsvpcConfiguration={subnets=[\"$SUBNET\"],securityGroups=[\"$SG_ID\"],assignPublicIp=ENABLED}" \
+            --network-configuration "awsvpcConfiguration={subnets=[\"$SUBNET\"],securityGroups=[\"$SG_ID\"],assignPublicIp=DISABLED}" \
             --overrides "$OVERRIDES" \
             --region $REGION \
             --query 'tasks[0].taskArn' --output text)
