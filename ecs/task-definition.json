@@ -1,6 +1,6 @@
 {
   "family": "vllm-qwen",
-  "networkMode": "awsvpc",
+  "networkMode": "bridge",
   "requiresCompatibilities": ["EC2"],
   "cpu": "4096",
   "memory": "14000",

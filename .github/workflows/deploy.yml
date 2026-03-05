@@ -257,8 +257,6 @@ jobs:
           REGION="${{ env.AWS_REGION }}"
           CLUSTER="${{ steps.cluster.outputs.cluster }}"
           TASK_DEF="${{ steps.taskdef.outputs.task_arn }}"
-          SUBNET="${{ steps.net.outputs.subnet }}"
-          SG_ID="${{ steps.sg.outputs.group_id }}"
           if [ -n "$HF_TOKEN" ]; then
             OVERRIDES=$(jq -n --arg t "$HF_TOKEN" '{containerOverrides:[{name:"vllm",environment:[{name:"HUGGING_FACE_HUB_TOKEN",value:$t}]}]}')
           else
@@ -268,7 +266,6 @@ jobs:
             --cluster $CLUSTER \
             --task-definition $TASK_DEF \
             --launch-type EC2 \
-            --network-configuration "awsvpcConfiguration={subnets=[\"$SUBNET\"],securityGroups=[\"$SG_ID\"],assignPublicIp=DISABLED}" \
             --overrides "$OVERRIDES" \
             --region $REGION \
             --output json > /tmp/run-task.json
@@ -286,7 +283,7 @@ jobs:
           fi
           echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
 
-      - name: Wait for task and get endpoint
+      - name: Wait for task running
         id: endpoint
         run: |
           REGION="${{ env.AWS_REGION }}"
@@ -305,13 +302,8 @@ jobs:
             fi
             STATUS=$(echo "$TASK_JSON" | jq -r '.tasks[0].lastStatus // "PENDING"')
             if [ "$STATUS" = "RUNNING" ]; then
-              ENI=$(echo "$TASK_JSON" | jq -r '.tasks[0].attachments[0].details[] | select(.name=="networkInterfaceId") | .value')
-              IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --region $REGION --query 'NetworkInterfaces[0].PrivateIpAddress' --output text 2>/dev/null || echo "")
-              if [ -z "$IP" ] || [ "$IP" = "None" ]; then
-                IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --region $REGION --query 'NetworkInterfaces[0].Association.PublicIp' --output text 2>/dev/null || echo "")
-              fi
-              echo "endpoint=$IP" >> $GITHUB_OUTPUT
-              echo "Task running at $IP:8000"
+              echo "endpoint=${{ steps.net.outputs.elastic_ip }}" >> $GITHUB_OUTPUT
+              echo "Task running (bridge mode: use instance IP)"
               exit 0
             fi
             if [ "$STATUS" = "STOPPED" ]; then
@@ -328,8 +320,8 @@ jobs:
 
       - name: Output
         run: |
-          ENDPOINT="${{ steps.endpoint.outputs.endpoint }}"
           EIP="${{ steps.net.outputs.elastic_ip }}"
-          echo "Task endpoint: http://$ENDPOINT:8000"
-          echo "Instance EIP (fallback): http://$EIP:8000"
-          echo "Test: curl http://$ENDPOINT:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"Qwen/Qwen2.5-7B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'"
+          echo "vLLM API: http://$EIP:8000"
+          echo ""
+          echo "Test models: curl http://$EIP:8000/v1/models"
+          echo "Test chat: curl http://$EIP:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"Qwen/Qwen2.5-7B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'"

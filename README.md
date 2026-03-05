@@ -21,7 +21,7 @@ curl http://EC2_IP:8000/v1/chat/completions \
   -d '{"model":"Qwen/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Replace `EC2_IP` with the Elastic IP, ECS task IP, or `localhost` for local Docker.
+Replace `EC2_IP` with the instance's Elastic IP (bridge mode) or task private IP (awsvpc), or `localhost` for local Docker.
 
 ## Configuration
 
@@ -112,10 +112,10 @@ echo ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config
 
 ### Run Task
 
+The task uses **bridge** network mode, so vLLM listens on the EC2 instance's port 8000.
+
 ```bash
 export ECS_CLUSTER=vllm-cluster
-export ECS_SUBNETS=subnet-xxx,subnet-yyy
-export ECS_SECURITY_GROUPS=sg-xxx
 ./ecs/run-task.sh
 ```
 
@@ -124,25 +124,21 @@ Or manually:
 ```bash
 aws ecs run-task --cluster vllm-cluster --task-definition vllm-qwen \
   --launch-type EC2 \
-  --network-configuration "awsvpcConfiguration={subnets=[subnet-xxx],securityGroups=[sg-xxx],assignPublicIp=DISABLED}"
+  --region us-east-1
 ```
 
 ### Get Endpoint and Test
 
-After the task is RUNNING, get the private IP:
+With bridge mode, use the **EC2 instance's public IP** (not the task IP):
 
 ```bash
-aws ecs describe-tasks --cluster vllm-cluster --tasks <TASK_ARN> \
-  --query 'tasks[0].attachments[0].details[?name==`privateIPv4Address`].value' --output text
-```
-
-Test (from within VPC or via bastion):
-
-```bash
-curl http://<TASK_IP>:8000/v1/chat/completions \
+curl http://<INSTANCE_IP>:8000/v1/models
+curl http://<INSTANCE_IP>:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"Qwen/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"hello"}]}'
 ```
+
+Ensure the instance security group allows inbound 8000.
 
 ### Gated Models
 
