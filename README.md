@@ -39,7 +39,7 @@ Replace `EC2_IP` with the Elastic IP, ECS task IP, or `localhost` for local Dock
 | Secret | Description |
 |--------|-------------|
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | AWS credentials |
-| `EC2_SSH_KEY` | Private key for `ubuntu` |
+| `EC2_SSH_KEY` | Private key for `ec2-user` (ECS AMI) |
 | `HUGGING_FACE_HUB_TOKEN` | Optional; for gated models |
 
 ### Model (deploy/.env)
@@ -63,9 +63,9 @@ docker compose up -d
 
 Models cached in the `models` volume (`/root/.cache/huggingface`).
 
-## Deploy
+## Deploy (EC2 via GitHub Actions)
 
-Push to `qa` or run the workflow manually. Steps: create/reuse g5.xlarge → attach EIP → install Docker + NVIDIA → run vLLM.
+Push to `qa` or run the workflow manually. Steps: create g5.xlarge with ECS GPU AMI → attach EIP → install Docker + NVIDIA → run vLLM. SSH user is `ec2-user`.
 
 ---
 

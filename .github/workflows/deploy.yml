@@ -1,0 +1,103 @@
+name: Deploy vLLM to EC2
+
+on:
+  push:
+    branches: [qa]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  INSTANCE_TYPE: g5.xlarge
+  INFER_MODEL: ${{ vars.INFER_MODEL || 'Qwen/Qwen2.5-7B-Instruct' }}
+  VLLM_IMAGE: ${{ vars.VLLM_IMAGE || 'vllm/vllm-openai:cu130-nightly' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      elastic_ip: ${{ steps.eip.outputs.elastic_ip }}
+
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get GPU AMI
+        id: ami
+        run: |
+          if [ -n "${{ vars.AWS_AMI_ID }}" ]; then
+            echo "ami_id=${{ vars.AWS_AMI_ID }}" >> $GITHUB_OUTPUT
+          else
+            AMI=$(aws ssm get-parameters \
+              --names /aws/service/ecs/optimized-ami/amazon-linux-2/gpu/recommended \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Parameters[0].Value' --output text | jq -r '.image_id')
+            echo "ami_id=$AMI" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create EC2 instance
+        id: ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ${{ steps.ami.outputs.ami_id }} \
+            --instance-type ${{ env.INSTANCE_TYPE }} \
+            --key-name ${{ vars.EC2_KEY_PAIR || 'ec2' }} \
+            --security-group-ids ${{ vars.AWS_SECURITY_GROUP_ID }} \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=vllm-inference},{Key=workflow,Value=deploy}]' \
+            --user-data '#!/bin/bash
+          echo ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config 2>/dev/null || true
+          yum install -y docker || true
+          systemctl start docker 2>/dev/null || true
+          usermod -aG docker ec2-user 2>/dev/null || true
+          distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+          curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.repo | tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+          yum install -y nvidia-container-toolkit
+          nvidia-ctk runtime configure --runtime=docker
+          systemctl restart docker
+          ' \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+      - name: Allocate and associate Elastic IP
+        id: eip
+        run: |
+          ALLOC_ID=$(aws ec2 allocate-address --domain vpc --region ${{ env.AWS_REGION }} --query 'AllocationId' --output text)
+          aws ec2 associate-address --instance-id ${{ steps.ec2.outputs.instance_id }} --allocation-id $ALLOC_ID --region ${{ env.AWS_REGION }}
+          EIP=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region ${{ env.AWS_REGION }} --query 'Addresses[0].PublicIp' --output text)
+          echo "elastic_ip=$EIP" >> $GITHUB_OUTPUT
+          echo "allocation_id=$ALLOC_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for SSH
+        run: |
+          INSTANCE_ID=${{ steps.ec2.outputs.instance_id }}
+          for i in {1..30}; do
+            if aws ec2 describe-instance-status --instance-ids $INSTANCE_ID --region ${{ env.AWS_REGION }} --query 'InstanceStatuses[0].InstanceStatus.Status' --output text 2>/dev/null | grep -q ok; then
+              echo "Instance ready"
+              break
+            fi
+            echo "Waiting for instance... ($i/30)"
+            sleep 20
+          done
+          sleep 60
+
+      - name: Deploy vLLM via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ steps.eip.outputs.elastic_ip }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            docker rm -f vllm 2>/dev/null || true
+            docker run -d --name vllm --gpus all --shm-size 4g -p 8000:8000 \
+              -e HF_TOKEN=${{ secrets.HUGGING_FACE_HUB_TOKEN }} \
+              ${{ env.VLLM_IMAGE }} \
+              --model ${{ env.INFER_MODEL }}
+
+      - name: Output
+        run: |
+          echo "Elastic IP: ${{ steps.eip.outputs.elastic_ip }}"
+          echo "Test: curl http://${{ steps.eip.outputs.elastic_ip }}:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"Qwen/Qwen2.5-7B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'"
