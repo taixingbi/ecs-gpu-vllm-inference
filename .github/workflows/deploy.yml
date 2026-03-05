@@ -280,7 +280,7 @@ jobs:
           REGION="${{ env.AWS_REGION }}"
           CLUSTER="${{ steps.cluster.outputs.cluster }}"
           TASK_ARN="${{ steps.task.outputs.task_arn }}"
-          for i in {1..60}; do
+          for i in {1..120}; do
             STATUS=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --region $REGION --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo "PENDING")
             if [ "$STATUS" = "RUNNING" ]; then
               ENI=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --region $REGION --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text)
@@ -297,10 +297,11 @@ jobs:
               aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --region $REGION
               exit 1
             fi
-            echo "Waiting for task... ($i/60)"
+            echo "Waiting for task... ($i/120) status=$STATUS"
             sleep 10
           done
-          echo "Timeout waiting for task"
+          echo "Timeout waiting for task (status: $STATUS)"
+          aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --region $REGION
           exit 1
 
       - name: Output
