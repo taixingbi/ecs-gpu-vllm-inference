@@ -1,0 +1,39 @@
+{
+  "family": "vllm-qwen",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["EC2"],
+  "cpu": "4096",
+  "memory": "16384",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "vllm",
+      "image": "vllm/vllm-openai:cu130-nightly",
+      "essential": true,
+      "command": ["--model", "Qwen/Qwen2.5-7B-Instruct"],
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "hostPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "resourceRequirements": [
+        {
+          "type": "GPU",
+          "value": "1"
+        }
+      ],
+      "linuxParameters": {
+        "sharedMemorySize": 4096
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/vllm-qwen",
+          "awslogs-region": "us-east-1"
+        }
+      }
+    }
+  ]
+}

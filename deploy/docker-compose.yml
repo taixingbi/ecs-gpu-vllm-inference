@@ -1,0 +1,21 @@
+services:
+  vllm:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:cu130-nightly}
+    command: ["--model", "${INFER_MODEL:-Qwen/Qwen2.5-7B-Instruct}"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - models:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: 4gb
+
+volumes:
+  models:
