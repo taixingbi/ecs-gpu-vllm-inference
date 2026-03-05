@@ -7,7 +7,7 @@ on:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-  INSTANCE_TYPE: g5.xlarge
+  INSTANCE_TYPE: ${{ vars.EC2_INSTANCE_TYPE || 'g5.xlarge' }}
   INFER_MODEL: ${{ vars.INFER_MODEL || 'Qwen/Qwen2.5-7B-Instruct' }}
   VLLM_IMAGE: ${{ vars.VLLM_IMAGE || 'vllm/vllm-openai:cu130-nightly' }}
 
