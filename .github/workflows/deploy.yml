@@ -41,11 +41,16 @@ jobs:
       - name: Create EC2 instance
         id: ec2
         run: |
+          EXTRA_ARGS=""
+          if [ -n "${{ vars.EC2_SUBNET_ID }}" ]; then
+            EXTRA_ARGS="--subnet-id ${{ vars.EC2_SUBNET_ID }}"
+          fi
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id ${{ steps.ami.outputs.ami_id }} \
             --instance-type ${{ env.INSTANCE_TYPE }} \
             --key-name ${{ vars.EC2_KEY_PAIR || 'ec2' }} \
             --security-group-ids ${{ vars.AWS_SECURITY_GROUP_ID }} \
+            $EXTRA_ARGS \
             --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=vllm-inference},{Key=workflow,Value=deploy}]' \
             --user-data '#!/bin/bash
           echo ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config 2>/dev/null || true
@@ -66,23 +71,36 @@ jobs:
         run: |
           aws ec2 wait instance-running --instance-ids ${{ steps.ec2.outputs.instance_id }} --region ${{ env.AWS_REGION }}
 
-      - name: Allocate and associate Elastic IP
+      - name: Get instance IP
         id: eip
         run: |
+          INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
+          REGION="${{ env.AWS_REGION }}"
+          EIP=""
           if [ -n "${{ vars.EC2_ELASTIC_IP_ALLOCATION_ID }}" ]; then
             ALLOC_ID="${{ vars.EC2_ELASTIC_IP_ALLOCATION_ID }}"
-            ASSOC_ID=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region ${{ env.AWS_REGION }} --query 'Addresses[0].AssociationId' --output text 2>/dev/null || echo "")
+            ASSOC_ID=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region $REGION --query 'Addresses[0].AssociationId' --output text 2>/dev/null || echo "")
             if [ -n "$ASSOC_ID" ] && [ "$ASSOC_ID" != "None" ]; then
-              aws ec2 disassociate-address --association-id $ASSOC_ID --region ${{ env.AWS_REGION }}
+              aws ec2 disassociate-address --association-id $ASSOC_ID --region $REGION
               sleep 5
             fi
+            aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $ALLOC_ID --region $REGION
+            EIP=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region $REGION --query 'Addresses[0].PublicIp' --output text)
           else
-            ALLOC_ID=$(aws ec2 allocate-address --domain vpc --region ${{ env.AWS_REGION }} --query 'AllocationId' --output text)
+            if ALLOC_ID=$(aws ec2 allocate-address --domain vpc --region $REGION --query 'AllocationId' --output text 2>/dev/null); then
+              aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $ALLOC_ID --region $REGION
+              EIP=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region $REGION --query 'Addresses[0].PublicIp' --output text)
+            else
+              echo "EIP limit reached, using instance public IP"
+              sleep 10
+              EIP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+              if [ -z "$EIP" ] || [ "$EIP" = "None" ]; then
+                echo "No public IP. Launch instance in a public subnet or set EC2_ELASTIC_IP_ALLOCATION_ID."
+                exit 1
+              fi
+            fi
           fi
-          aws ec2 associate-address --instance-id ${{ steps.ec2.outputs.instance_id }} --allocation-id $ALLOC_ID --region ${{ env.AWS_REGION }}
-          EIP=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region ${{ env.AWS_REGION }} --query 'Addresses[0].PublicIp' --output text)
           echo "elastic_ip=$EIP" >> $GITHUB_OUTPUT
-          echo "allocation_id=$ALLOC_ID" >> $GITHUB_OUTPUT
 
       - name: Wait for SSH
         run: |

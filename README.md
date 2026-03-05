@@ -34,6 +34,7 @@ Replace `EC2_IP` with the Elastic IP, ECS task IP, or `localhost` for local Dock
 | `AWS_SECURITY_GROUP_ID` | SG with inbound 22, 8000 |
 | `EC2_KEY_PAIR` | SSH key name (default: `ec2`) |
 | `EC2_ELASTIC_IP_ALLOCATION_ID` | Reuse existing EIP (avoids AddressLimitExceeded; e.g. `eipalloc-xxx`) |
+| `EC2_SUBNET_ID` | Public subnet for auto public IP when EIP limit reached (optional) |
 | `EC2_INSTANCE_TYPE` | GPU instance (default: `g5.xlarge`). Use `g4dn.xlarge` if vCPU limit exceeded |
 
 ### Repo secrets
