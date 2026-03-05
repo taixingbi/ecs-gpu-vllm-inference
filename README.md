@@ -33,6 +33,7 @@ Replace `EC2_IP` with the Elastic IP, ECS task IP, or `localhost` for local Dock
 | `AWS_REGION` | Region (default: `us-east-1`) |
 | `AWS_SECURITY_GROUP_ID` | SG ID (sg-xxx) or name (default: `ec2`) with inbound 8000 |
 | `EC2_IAM_INSTANCE_PROFILE` | IAM instance profile for SSM (default: `ec2-ssm-role`); must have `AmazonSSMManagedInstanceCore` |
+| `EC2_ROOT_VOLUME_SIZE` | Root EBS volume size in GB (default: `100`; vLLM image + model need ~50GB+) |
 | `EC2_KEY_PAIR` | SSH key name (optional; only needed for manual SSH) |
 | `EC2_ELASTIC_IP_ALLOCATION_ID` | Reuse existing EIP (avoids AddressLimitExceeded; e.g. `eipalloc-xxx`) |
 | `EC2_SUBNET_ID` | Public subnet for auto public IP when EIP limit reached (optional) |
@@ -70,7 +71,7 @@ Models cached in the `models` volume (`/root/.cache/huggingface`).
 
 Push to `qa` or run the workflow manually. Steps: create g5.xlarge with ECS GPU AMI → attach EIP → deploy vLLM via SSM (no SSH keys required). The EC2 instance must use an IAM instance profile with `AmazonSSMManagedInstanceCore`; the GitHub Actions IAM user needs `ssm:SendCommand` and `ssm:GetCommandInvocation`.
 
-**Existing instances:** If you have an instance created before the SSM migration, attach the IAM instance profile (`ec2-ssm-role`) to it, or delete it and let the workflow create a new one. You can remove the `EC2_SSH_KEY` secret from GitHub.
+**Existing instances:** If you have an instance created before the SSM migration, attach the IAM instance profile (`ec2-ssm-role`) to it, or delete it and let the workflow create a new one. You can remove the `EC2_SSH_KEY` secret from GitHub. If you see "no space left on device", delete the instance so a new one is created with a 100GB root volume (`EC2_ROOT_VOLUME_SIZE`).
 
 ---
 

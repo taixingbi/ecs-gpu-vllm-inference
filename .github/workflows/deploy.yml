@@ -76,11 +76,13 @@ jobs:
               EXTRA_ARGS="$EXTRA_ARGS --key-name ${{ vars.EC2_KEY_PAIR }}"
             fi
             IAM_PROFILE="${{ vars.EC2_IAM_INSTANCE_PROFILE || 'ec2-ssm-role' }}"
+            ROOT_GB="${{ vars.EC2_ROOT_VOLUME_SIZE || '100' }}"
             INSTANCE_ID=$(aws ec2 run-instances \
               --image-id $AMI \
               --instance-type ${{ env.INSTANCE_TYPE }} \
               --iam-instance-profile Name=$IAM_PROFILE \
               --security-group-ids $SG_ID \
+              --block-device-mappings "[{\"DeviceName\":\"/dev/xvda\",\"Ebs\":{\"VolumeSize\":$ROOT_GB,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
               $EXTRA_ARGS \
               --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME},{Key=workflow,Value=deploy}]" \
               --user-data '#!/bin/bash
