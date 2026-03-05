@@ -264,14 +264,26 @@ jobs:
           else
             OVERRIDES='{}'
           fi
-          TASK_ARN=$(aws ecs run-task \
+          aws ecs run-task \
             --cluster $CLUSTER \
             --task-definition $TASK_DEF \
             --launch-type EC2 \
             --network-configuration "awsvpcConfiguration={subnets=[\"$SUBNET\"],securityGroups=[\"$SG_ID\"],assignPublicIp=DISABLED}" \
             --overrides "$OVERRIDES" \
             --region $REGION \
-            --query 'tasks[0].taskArn' --output text)
+            --output json > /tmp/run-task.json
+          FAILURES=$(jq -r '.failures // [] | length' /tmp/run-task.json)
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "Run-task placement failed:"
+            jq '.failures' /tmp/run-task.json
+            exit 1
+          fi
+          TASK_ARN=$(jq -r '.tasks[0].taskArn // empty' /tmp/run-task.json)
+          if [ -z "$TASK_ARN" ]; then
+            echo "No task returned from run-task:"
+            cat /tmp/run-task.json
+            exit 1
+          fi
           echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
 
       - name: Wait for task and get endpoint
@@ -279,14 +291,24 @@ jobs:
         run: |
           REGION="${{ env.AWS_REGION }}"
           CLUSTER="${{ steps.cluster.outputs.cluster }}"
-          TASK_ARN="${{ steps.task.outputs.task_arn }}"
+          TASK_ARN=$(echo "${{ steps.task.outputs.task_arn }}" | tr -d '\n\r ')
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "Invalid task ARN"
+            exit 1
+          fi
           for i in {1..120}; do
-            STATUS=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --region $REGION --query 'tasks[0].lastStatus' --output text 2>/dev/null || echo "PENDING")
+            TASK_JSON=$(aws ecs describe-tasks --cluster $CLUSTER --tasks "$TASK_ARN" --region $REGION --include STOPPED --output json)
+            if [ "$(echo "$TASK_JSON" | jq -r '.tasks | length')" = "0" ]; then
+              echo "Task not found (may have been stopped):"
+              echo "$TASK_JSON" | jq .
+              exit 1
+            fi
+            STATUS=$(echo "$TASK_JSON" | jq -r '.tasks[0].lastStatus // "PENDING"')
             if [ "$STATUS" = "RUNNING" ]; then
-              ENI=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --region $REGION --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text)
-              IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --region $REGION --query 'NetworkInterfaces[0].Association.PublicIp' --output text 2>/dev/null || echo "")
+              ENI=$(echo "$TASK_JSON" | jq -r '.tasks[0].attachments[0].details[] | select(.name=="networkInterfaceId") | .value')
+              IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --region $REGION --query 'NetworkInterfaces[0].PrivateIpAddress' --output text 2>/dev/null || echo "")
               if [ -z "$IP" ] || [ "$IP" = "None" ]; then
-                IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --region $REGION --query 'NetworkInterfaces[0].PrivateIpAddress' --output text)
+                IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --region $REGION --query 'NetworkInterfaces[0].Association.PublicIp' --output text 2>/dev/null || echo "")
               fi
               echo "endpoint=$IP" >> $GITHUB_OUTPUT
               echo "Task running at $IP:8000"
@@ -294,14 +316,14 @@ jobs:
             fi
             if [ "$STATUS" = "STOPPED" ]; then
               echo "Task stopped unexpectedly"
-              aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --region $REGION
+              echo "$TASK_JSON" | jq '.tasks[0] | {stoppedReason, stopCode, containers: [.containers[] | {name, exitCode, reason}]}'
               exit 1
             fi
             echo "Waiting for task... ($i/120) status=$STATUS"
             sleep 10
           done
           echo "Timeout waiting for task (status: $STATUS)"
-          aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --region $REGION
+          echo "$TASK_JSON" | jq '.tasks[0] | {lastStatus, stoppedReason, stopCode, containers: [.containers[]? | {name, exitCode, reason}]}'
           exit 1
 
       - name: Output
