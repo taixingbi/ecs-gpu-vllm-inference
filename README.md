@@ -31,8 +31,9 @@ Replace `EC2_IP` with the Elastic IP, ECS task IP, or `localhost` for local Dock
 |---------|-------------|
 | `AWS_AMI_ID` | GPU AMI (optional; auto-resolved if unset) |
 | `AWS_REGION` | Region (default: `us-east-1`) |
-| `AWS_SECURITY_GROUP_ID` | SG ID (sg-xxx) or name (default: `ec2`) with inbound 22, 8000 |
-| `EC2_KEY_PAIR` | SSH key name (default: `ec2`; key file is ec2.pem) |
+| `AWS_SECURITY_GROUP_ID` | SG ID (sg-xxx) or name (default: `ec2`) with inbound 8000 |
+| `EC2_IAM_INSTANCE_PROFILE` | IAM instance profile for SSM (default: `ec2-ssm-role`); must have `AmazonSSMManagedInstanceCore` |
+| `EC2_KEY_PAIR` | SSH key name (optional; only needed for manual SSH) |
 | `EC2_ELASTIC_IP_ALLOCATION_ID` | Reuse existing EIP (avoids AddressLimitExceeded; e.g. `eipalloc-xxx`) |
 | `EC2_SUBNET_ID` | Public subnet for auto public IP when EIP limit reached (optional) |
 | `EC2_INSTANCE_TYPE` | GPU instance (default: `g5.xlarge`). Use `g4dn.xlarge` if vCPU limit exceeded |
@@ -41,8 +42,7 @@ Replace `EC2_IP` with the Elastic IP, ECS task IP, or `localhost` for local Dock
 
 | Secret | Description |
 |--------|-------------|
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | AWS credentials |
-| `EC2_SSH_KEY` | Private key contents (e.g. ec2.pem) for `ec2-user` |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | AWS credentials (IAM user needs `ssm:SendCommand`, `ssm:GetCommandInvocation`) |
 | `HUGGING_FACE_HUB_TOKEN` | Optional; for gated models |
 
 ### Model (deploy/.env)
@@ -68,7 +68,9 @@ Models cached in the `models` volume (`/root/.cache/huggingface`).
 
 ## Deploy (EC2 via GitHub Actions)
 
-Push to `qa` or run the workflow manually. Steps: create g5.xlarge with ECS GPU AMI → attach EIP → install Docker + NVIDIA → run vLLM. SSH user is `ec2-user`.
+Push to `qa` or run the workflow manually. Steps: create g5.xlarge with ECS GPU AMI → attach EIP → deploy vLLM via SSM (no SSH keys required). The EC2 instance must use an IAM instance profile with `AmazonSSMManagedInstanceCore`; the GitHub Actions IAM user needs `ssm:SendCommand` and `ssm:GetCommandInvocation`.
+
+**Existing instances:** If you have an instance created before the SSM migration, attach the IAM instance profile (`ec2-ssm-role`) to it, or delete it and let the workflow create a new one. You can remove the `EC2_SSH_KEY` secret from GitHub.
 
 ---
 
