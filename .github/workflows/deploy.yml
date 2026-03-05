@@ -161,6 +161,32 @@ jobs:
           done
           sleep 15
 
+      - name: Pull vLLM image via SSM
+        run: |
+          INSTANCE_ID=${{ steps.ec2.outputs.instance_id }}
+          REGION=${{ env.AWS_REGION }}
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters '{"commands":["docker pull ${{ env.VLLM_IMAGE }}"]}' \
+            --timeout-seconds 2400 \
+            --region $REGION \
+            --query 'Command.CommandId' --output text)
+          for i in {1..180}; do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region $REGION --query 'Status' --output text 2>/dev/null || echo "Pending")
+            if [ "$STATUS" = "Success" ]; then
+              echo "Image pull succeeded"
+              break
+            fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "Image pull failed: $STATUS"
+              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region $REGION
+              exit 1
+            fi
+            echo "Pulling image... ($i/180)"
+            sleep 10
+          done
+
       - name: Deploy vLLM via SSM
         run: |
           INSTANCE_ID=${{ steps.ec2.outputs.instance_id }}
@@ -169,6 +195,7 @@ jobs:
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --parameters '{"commands":["docker rm -f vllm 2>/dev/null || true","docker run -d --name vllm --gpus all --shm-size 4g -p 8000:8000 -e HF_TOKEN=${{ secrets.HUGGING_FACE_HUB_TOKEN }} ${{ env.VLLM_IMAGE }} --model ${{ env.INFER_MODEL }}"]}' \
+            --timeout-seconds 600 \
             --region $REGION \
             --query 'Command.CommandId' --output text)
           for i in {1..60}; do
