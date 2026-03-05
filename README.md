@@ -33,6 +33,7 @@ Replace `EC2_IP` with the Elastic IP, ECS task IP, or `localhost` for local Dock
 | `AWS_REGION` | Region (default: `us-east-1`) |
 | `AWS_SECURITY_GROUP_ID` | SG with inbound 22, 8000 |
 | `EC2_KEY_PAIR` | SSH key name (default: `ec2`) |
+| `EC2_ELASTIC_IP_ALLOCATION_ID` | Reuse existing EIP (avoids AddressLimitExceeded; e.g. `eipalloc-xxx`) |
 
 ### Repo secrets
 

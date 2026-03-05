@@ -69,7 +69,16 @@ jobs:
       - name: Allocate and associate Elastic IP
         id: eip
         run: |
-          ALLOC_ID=$(aws ec2 allocate-address --domain vpc --region ${{ env.AWS_REGION }} --query 'AllocationId' --output text)
+          if [ -n "${{ vars.EC2_ELASTIC_IP_ALLOCATION_ID }}" ]; then
+            ALLOC_ID="${{ vars.EC2_ELASTIC_IP_ALLOCATION_ID }}"
+            ASSOC_ID=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region ${{ env.AWS_REGION }} --query 'Addresses[0].AssociationId' --output text 2>/dev/null || echo "")
+            if [ -n "$ASSOC_ID" ] && [ "$ASSOC_ID" != "None" ]; then
+              aws ec2 disassociate-address --association-id $ASSOC_ID --region ${{ env.AWS_REGION }}
+              sleep 5
+            fi
+          else
+            ALLOC_ID=$(aws ec2 allocate-address --domain vpc --region ${{ env.AWS_REGION }} --query 'AllocationId' --output text)
+          fi
           aws ec2 associate-address --instance-id ${{ steps.ec2.outputs.instance_id }} --allocation-id $ALLOC_ID --region ${{ env.AWS_REGION }}
           EIP=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region ${{ env.AWS_REGION }} --query 'Addresses[0].PublicIp' --output text)
           echo "elastic_ip=$EIP" >> $GITHUB_OUTPUT
