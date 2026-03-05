@@ -229,14 +229,14 @@ jobs:
         run: |
           REGION="${{ env.AWS_REGION }}"
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          TASK_JSON=$(jq \
+          jq \
             --arg img "${{ env.VLLM_IMAGE }}" \
             --arg model "${{ env.INFER_MODEL }}" \
             --arg role "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole" \
             --arg region "$REGION" \
             '.containerDefinitions[0].image = $img | .containerDefinitions[0].command = ["--model", $model] | .executionRoleArn = $role | .containerDefinitions[0].logConfiguration.options["awslogs-region"] = $region' \
-            ecs/task-definition.json)
-          TASK_ARN=$(echo "$TASK_JSON" | aws ecs register-task-definition --cli-input-json file:///dev/stdin --region $REGION --query 'taskDefinition.taskDefinitionArn' --output text)
+            ecs/task-definition.json > /tmp/task-def.json
+          TASK_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/task-def.json --region $REGION --query 'taskDefinition.taskDefinitionArn' --output text)
           echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
 
       - name: Stop existing vLLM tasks
