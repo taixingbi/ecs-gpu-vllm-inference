@@ -31,8 +31,8 @@ Replace `EC2_IP` with the Elastic IP, ECS task IP, or `localhost` for local Dock
 |---------|-------------|
 | `AWS_AMI_ID` | GPU AMI (optional; auto-resolved if unset) |
 | `AWS_REGION` | Region (default: `us-east-1`) |
-| `AWS_SECURITY_GROUP_ID` | SG with inbound 22, 8000 |
-| `EC2_KEY_PAIR` | SSH key name (default: `ec2`) |
+| `AWS_SECURITY_GROUP_ID` | SG ID (sg-xxx) or name (default: `ec2`) with inbound 22, 8000 |
+| `EC2_KEY_PAIR` | SSH key name (default: `ec2`; key file is ec2.pem) |
 | `EC2_ELASTIC_IP_ALLOCATION_ID` | Reuse existing EIP (avoids AddressLimitExceeded; e.g. `eipalloc-xxx`) |
 | `EC2_SUBNET_ID` | Public subnet for auto public IP when EIP limit reached (optional) |
 | `EC2_INSTANCE_TYPE` | GPU instance (default: `g5.xlarge`). Use `g4dn.xlarge` if vCPU limit exceeded |
@@ -42,7 +42,7 @@ Replace `EC2_IP` with the Elastic IP, ECS task IP, or `localhost` for local Dock
 | Secret | Description |
 |--------|-------------|
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | AWS credentials |
-| `EC2_SSH_KEY` | Private key for `ec2-user` (ECS AMI) |
+| `EC2_SSH_KEY` | Private key contents (e.g. ec2.pem) for `ec2-user` |
 | `HUGGING_FACE_HUB_TOKEN` | Optional; for gated models |
 
 ### Model (deploy/.env)

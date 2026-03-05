@@ -25,11 +25,27 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Resolve security group
+        id: sg
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          SG_INPUT="${{ vars.AWS_SECURITY_GROUP_ID || 'ec2' }}"
+          if [[ "$SG_INPUT" == sg-* ]]; then
+            echo "group_id=$SG_INPUT" >> $GITHUB_OUTPUT
+          else
+            SG_ID=$(aws ec2 describe-security-groups \
+              --filters "Name=group-name,Values=$SG_INPUT" \
+              --region $REGION \
+              --query 'SecurityGroups[0].GroupId' --output text)
+            echo "group_id=$SG_ID" >> $GITHUB_OUTPUT
+          fi
+
       - name: Find or create EC2 instance
         id: ec2
         run: |
           REGION="${{ env.AWS_REGION }}"
           INSTANCE_NAME="ecs-gpu-vllm-inference"
+          SG_ID="${{ steps.sg.outputs.group_id }}"
           EXISTING=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped" \
             --region $REGION \
@@ -60,7 +76,7 @@ jobs:
               --image-id $AMI \
               --instance-type ${{ env.INSTANCE_TYPE }} \
               --key-name ${{ vars.EC2_KEY_PAIR || 'ec2' }} \
-              --security-group-ids ${{ vars.AWS_SECURITY_GROUP_ID }} \
+              --security-group-ids $SG_ID \
               $EXTRA_ARGS \
               --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME},{Key=workflow,Value=deploy}]" \
               --user-data '#!/bin/bash
