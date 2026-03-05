@@ -25,46 +25,59 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Get GPU AMI
-        id: ami
-        run: |
-          if [ -n "${{ vars.AWS_AMI_ID }}" ]; then
-            echo "ami_id=${{ vars.AWS_AMI_ID }}" >> $GITHUB_OUTPUT
-          else
-            AMI=$(aws ssm get-parameters \
-              --names /aws/service/ecs/optimized-ami/amazon-linux-2/gpu/recommended \
-              --region ${{ env.AWS_REGION }} \
-              --query 'Parameters[0].Value' --output text | jq -r '.image_id')
-            echo "ami_id=$AMI" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create EC2 instance
+      - name: Find or create EC2 instance
         id: ec2
         run: |
-          EXTRA_ARGS=""
-          if [ -n "${{ vars.EC2_SUBNET_ID }}" ]; then
-            EXTRA_ARGS="--subnet-id ${{ vars.EC2_SUBNET_ID }}"
+          REGION="${{ env.AWS_REGION }}"
+          INSTANCE_NAME="ecs-gpu-vllm-inference"
+          EXISTING=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped" \
+            --region $REGION \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+            echo "Using existing instance: $EXISTING"
+            INSTANCE_ID="$EXISTING"
+            echo "created=false" >> $GITHUB_OUTPUT
+            STATE=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].State.Name' --output text)
+            if [ "$STATE" = "stopped" ]; then
+              aws ec2 start-instances --instance-ids $INSTANCE_ID --region $REGION
+            fi
+          else
+            echo "Creating new instance: $INSTANCE_NAME"
+            if [ -n "${{ vars.AWS_AMI_ID }}" ]; then
+              AMI="${{ vars.AWS_AMI_ID }}"
+            else
+              AMI=$(aws ssm get-parameters \
+                --names /aws/service/ecs/optimized-ami/amazon-linux-2/gpu/recommended \
+                --region $REGION \
+                --query 'Parameters[0].Value' --output text | jq -r '.image_id')
+            fi
+            EXTRA_ARGS=""
+            if [ -n "${{ vars.EC2_SUBNET_ID }}" ]; then
+              EXTRA_ARGS="--subnet-id ${{ vars.EC2_SUBNET_ID }}"
+            fi
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id $AMI \
+              --instance-type ${{ env.INSTANCE_TYPE }} \
+              --key-name ${{ vars.EC2_KEY_PAIR || 'ec2' }} \
+              --security-group-ids ${{ vars.AWS_SECURITY_GROUP_ID }} \
+              $EXTRA_ARGS \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME},{Key=workflow,Value=deploy}]" \
+              --user-data '#!/bin/bash
+            echo ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config 2>/dev/null || true
+            yum install -y docker || true
+            systemctl start docker 2>/dev/null || true
+            usermod -aG docker ec2-user 2>/dev/null || true
+            distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+            curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.repo | tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+            yum install -y nvidia-container-toolkit
+            nvidia-ctk runtime configure --runtime=docker
+            systemctl restart docker
+            ' \
+              --region $REGION \
+              --query 'Instances[0].InstanceId' --output text)
+            echo "created=true" >> $GITHUB_OUTPUT
           fi
-          INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id ${{ steps.ami.outputs.ami_id }} \
-            --instance-type ${{ env.INSTANCE_TYPE }} \
-            --key-name ${{ vars.EC2_KEY_PAIR || 'ec2' }} \
-            --security-group-ids ${{ vars.AWS_SECURITY_GROUP_ID }} \
-            $EXTRA_ARGS \
-            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=vllm-inference},{Key=workflow,Value=deploy}]' \
-            --user-data '#!/bin/bash
-          echo ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config 2>/dev/null || true
-          yum install -y docker || true
-          systemctl start docker 2>/dev/null || true
-          usermod -aG docker ec2-user 2>/dev/null || true
-          distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-          curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.repo | tee /etc/yum.repos.d/nvidia-container-toolkit.repo
-          yum install -y nvidia-container-toolkit
-          nvidia-ctk runtime configure --runtime=docker
-          systemctl restart docker
-          ' \
-            --region ${{ env.AWS_REGION }} \
-            --query 'Instances[0].InstanceId' --output text)
           echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
 
       - name: Wait for instance running
@@ -76,8 +89,17 @@ jobs:
         run: |
           INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
           REGION="${{ env.AWS_REGION }}"
+          CREATED="${{ steps.ec2.outputs.created }}"
           EIP=""
-          if [ -n "${{ vars.EC2_ELASTIC_IP_ALLOCATION_ID }}" ]; then
+          if [ "$CREATED" = "false" ]; then
+            echo "Reusing instance, getting existing IP"
+            sleep 5
+            EIP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+            if [ -z "$EIP" ] || [ "$EIP" = "None" ]; then
+              echo "Instance has no public IP. Associate an EIP manually or set EC2_ELASTIC_IP_ALLOCATION_ID."
+              exit 1
+            fi
+          elif [ -n "${{ vars.EC2_ELASTIC_IP_ALLOCATION_ID }}" ]; then
             ALLOC_ID="${{ vars.EC2_ELASTIC_IP_ALLOCATION_ID }}"
             ASSOC_ID=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region $REGION --query 'Addresses[0].AssociationId' --output text 2>/dev/null || echo "")
             if [ -n "$ASSOC_ID" ] && [ "$ASSOC_ID" != "None" ]; then
