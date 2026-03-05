@@ -297,7 +297,7 @@ jobs:
             exit 1
           fi
           for i in {1..120}; do
-            TASK_JSON=$(aws ecs describe-tasks --cluster $CLUSTER --tasks "$TASK_ARN" --region $REGION --include STOPPED --output json)
+            TASK_JSON=$(aws ecs describe-tasks --cluster $CLUSTER --tasks "$TASK_ARN" --region $REGION --output json)
             if [ "$(echo "$TASK_JSON" | jq -r '.tasks | length')" = "0" ]; then
               echo "Task not found (may have been stopped):"
               echo "$TASK_JSON" | jq .
