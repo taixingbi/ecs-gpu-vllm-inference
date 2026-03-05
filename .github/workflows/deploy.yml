@@ -62,6 +62,10 @@ jobs:
             --query 'Instances[0].InstanceId' --output text)
           echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
 
+      - name: Wait for instance running
+        run: |
+          aws ec2 wait instance-running --instance-ids ${{ steps.ec2.outputs.instance_id }} --region ${{ env.AWS_REGION }}
+
       - name: Allocate and associate Elastic IP
         id: eip
         run: |
