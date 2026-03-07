@@ -31,7 +31,7 @@ Replace `EC2_IP` with the instance's Elastic IP (bridge mode) or task private IP
 |---------|-------------|
 | `AWS_AMI_ID` | GPU AMI (optional; auto-resolved if unset) |
 | `AWS_REGION` | Region (default: `us-east-1`) |
-| `AWS_SECURITY_GROUP_ID` | SG ID (sg-xxx) or name (default: `ec2`) with inbound 8000 |
+| `AWS_SECURITY_GROUP_NAME` | Security group name (default: `ec2`) to look up; or sg-xxx for direct ID. Inbound 8000 required. |
 | `ECS_CLUSTER` | ECS cluster name (default: `vllm-cluster`) |
 | `EC2_IAM_INSTANCE_PROFILE` | IAM instance profile (default: `ec2-ssm-role`); must have `AmazonEC2ContainerServiceforEC2Role` for ECS |
 | `EC2_ROOT_VOLUME_SIZE` | Root EBS volume size in GB (default: `100`; vLLM image + model need ~50GB+) |

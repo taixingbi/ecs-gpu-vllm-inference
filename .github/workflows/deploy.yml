@@ -49,7 +49,7 @@ jobs:
         id: sg
         run: |
           REGION="${{ env.AWS_REGION }}"
-          SG_INPUT="${{ vars.AWS_SECURITY_GROUP_ID || 'ec2' }}"
+          SG_INPUT="${{ vars.AWS_SECURITY_GROUP_NAME || 'ec2' }}"
           if [[ "$SG_INPUT" == sg-* ]]; then
             echo "group_id=$SG_INPUT" >> $GITHUB_OUTPUT
           else
