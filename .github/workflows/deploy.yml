@@ -33,9 +33,15 @@ jobs:
         run: |
           REGION="${{ env.AWS_REGION }}"
           CLUSTER="${{ vars.ECS_CLUSTER || 'vllm-cluster' }}"
-          if aws ecs describe-clusters --clusters "$CLUSTER" --region $REGION --query 'clusters[0].status' --output text 2>/dev/null | grep -q ACTIVE; then
-            echo "Cluster $CLUSTER exists"
+          STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER" --region $REGION --query 'clusters[0].status' --output text 2>/dev/null || echo "MISSING")
+          if [ "$STATUS" = "ACTIVE" ]; then
+            echo "Cluster $CLUSTER exists and is ACTIVE"
           else
+            if [ "$STATUS" = "INACTIVE" ]; then
+              echo "Cluster $CLUSTER is INACTIVE (deleted), deleting before recreate..."
+              aws ecs delete-cluster --cluster "$CLUSTER" --region $REGION 2>/dev/null || true
+              sleep 5
+            fi
             aws ecs create-cluster --cluster-name "$CLUSTER" --region $REGION
             echo "Created cluster $CLUSTER"
           fi
