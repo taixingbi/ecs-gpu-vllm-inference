@@ -1,0 +1,351 @@
+name: Deploy vLLM to ECS
+
+on:
+  push:
+    branches: [qa]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  INSTANCE_TYPE: ${{ vars.EC2_INSTANCE_TYPE || 'g5.xlarge' }}
+  INFER_MODEL: ${{ vars.INFER_MODEL || 'Qwen/Qwen2.5-7B-Instruct' }}
+  VLLM_IMAGE: ${{ vars.VLLM_IMAGE || 'vllm/vllm-openai:cu130-nightly' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      endpoint: ${{ steps.endpoint.outputs.endpoint }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create ECS cluster
+        id: cluster
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ vars.ECS_CLUSTER || 'vllm-cluster' }}"
+          STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER" --region $REGION --query 'clusters[0].status' --output text 2>/dev/null || echo "MISSING")
+          if [ "$STATUS" = "ACTIVE" ]; then
+            echo "Cluster $CLUSTER exists and is ACTIVE"
+          else
+            if [ "$STATUS" = "INACTIVE" ]; then
+              echo "Cluster $CLUSTER is INACTIVE (deleted), deleting before recreate..."
+              aws ecs delete-cluster --cluster "$CLUSTER" --region $REGION 2>/dev/null || true
+              sleep 5
+            fi
+            aws ecs create-cluster --cluster-name "$CLUSTER" --region $REGION
+            echo "Created cluster $CLUSTER"
+          fi
+          echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+
+      - name: Create CloudWatch log group
+        run: |
+          aws logs create-log-group --log-group-name /ecs/vllm-qwen --region ${{ env.AWS_REGION }} 2>/dev/null || true
+
+      - name: Resolve security group
+        id: sg
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          SG_INPUT="${{ vars.AWS_SECURITY_GROUP_NAME || 'ec2' }}"
+          if [[ "$SG_INPUT" == sg-* ]]; then
+            echo "group_id=$SG_INPUT" >> $GITHUB_OUTPUT
+          else
+            SG_ID=$(aws ec2 describe-security-groups \
+              --filters "Name=group-name,Values=$SG_INPUT" \
+              --region $REGION \
+              --query 'SecurityGroups[0].GroupId' --output text)
+            echo "group_id=$SG_ID" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Find or create EC2 instance
+        id: ec2
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ steps.cluster.outputs.cluster }}"
+          INSTANCE_NAME="ecs-gpu-vllm-inference"
+          SG_ID="${{ steps.sg.outputs.group_id }}"
+          EXISTING=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped" \
+            --region $REGION \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+            echo "Using existing instance: $EXISTING"
+            INSTANCE_ID="$EXISTING"
+            echo "created=false" >> $GITHUB_OUTPUT
+            STATE=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].State.Name' --output text)
+            if [ "$STATE" = "stopped" ]; then
+              aws ec2 start-instances --instance-ids $INSTANCE_ID --region $REGION
+            fi
+          else
+            echo "Creating new instance: $INSTANCE_NAME"
+            if [ -n "${{ vars.AWS_AMI_ID }}" ]; then
+              AMI="${{ vars.AWS_AMI_ID }}"
+            else
+              AMI=$(aws ssm get-parameters \
+                --names /aws/service/ecs/optimized-ami/amazon-linux-2/gpu/recommended \
+                --region $REGION \
+                --query 'Parameters[0].Value' --output text | jq -r '.image_id')
+            fi
+            EXTRA_ARGS=""
+            if [ -n "${{ vars.EC2_SUBNET_ID }}" ]; then
+              EXTRA_ARGS="--subnet-id ${{ vars.EC2_SUBNET_ID }}"
+            fi
+            if [ -n "${{ vars.EC2_KEY_PAIR }}" ]; then
+              EXTRA_ARGS="$EXTRA_ARGS --key-name ${{ vars.EC2_KEY_PAIR }}"
+            fi
+            IAM_PROFILE="${{ vars.EC2_IAM_INSTANCE_PROFILE || 'ec2-ssm-role' }}"
+            ROOT_GB="${{ vars.EC2_ROOT_VOLUME_SIZE || '100' }}"
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id $AMI \
+              --instance-type ${{ env.INSTANCE_TYPE }} \
+              --iam-instance-profile Name=$IAM_PROFILE \
+              --security-group-ids $SG_ID \
+              --block-device-mappings "[{\"DeviceName\":\"/dev/xvda\",\"Ebs\":{\"VolumeSize\":$ROOT_GB,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
+              $EXTRA_ARGS \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME},{Key=workflow,Value=deploy}]" \
+              --user-data "#!/bin/bash
+            echo ECS_CLUSTER=$CLUSTER >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config
+            distribution=\$(. /etc/os-release;echo \$ID\$VERSION_ID)
+            curl -s -L https://nvidia.github.io/libnvidia-container/\$distribution/libnvidia-container.repo | tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+            yum install -y nvidia-container-toolkit
+            nvidia-ctk runtime configure --runtime=docker
+            systemctl restart docker
+            " \
+              --region $REGION \
+              --query 'Instances[0].InstanceId' --output text)
+            echo "created=true" >> $GITHUB_OUTPUT
+          fi
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for instance running
+        run: |
+          aws ec2 wait instance-running --instance-ids ${{ steps.ec2.outputs.instance_id }} --region ${{ env.AWS_REGION }}
+
+      - name: Get instance subnet and EIP
+        id: net
+        run: |
+          INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
+          REGION="${{ env.AWS_REGION }}"
+          CREATED="${{ steps.ec2.outputs.created }}"
+          SUBNET=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].SubnetId' --output text)
+          echo "subnet=$SUBNET" >> $GITHUB_OUTPUT
+          if [ "$CREATED" = "false" ]; then
+            EIP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          elif [ -n "${{ vars.EC2_ELASTIC_IP_ALLOCATION_ID }}" ]; then
+            ALLOC_ID="${{ vars.EC2_ELASTIC_IP_ALLOCATION_ID }}"
+            ASSOC_ID=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region $REGION --query 'Addresses[0].AssociationId' --output text 2>/dev/null || echo "")
+            if [ -n "$ASSOC_ID" ] && [ "$ASSOC_ID" != "None" ]; then
+              aws ec2 disassociate-address --association-id $ASSOC_ID --region $REGION
+              sleep 5
+            fi
+            aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $ALLOC_ID --region $REGION
+            EIP=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region $REGION --query 'Addresses[0].PublicIp' --output text)
+          else
+            if ALLOC_ID=$(aws ec2 allocate-address --domain vpc --region $REGION --query 'AllocationId' --output text 2>/dev/null); then
+              aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $ALLOC_ID --region $REGION
+              EIP=$(aws ec2 describe-addresses --allocation-ids $ALLOC_ID --region $REGION --query 'Addresses[0].PublicIp' --output text)
+            else
+              sleep 10
+              EIP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+            fi
+          fi
+          echo "elastic_ip=$EIP" >> $GITHUB_OUTPUT
+
+      - name: Configure ECS agent via SSM
+        run: |
+          # #region agent log
+          echo "::notice::[DEBUG] CLUSTER=${{ steps.cluster.outputs.cluster }} INSTANCE_ID=${{ steps.ec2.outputs.instance_id }} CREATED=${{ steps.ec2.outputs.created }}"
+          # #endregion
+          INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ steps.cluster.outputs.cluster }}"
+          for i in {1..30}; do
+            if aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$INSTANCE_ID" --region $REGION --query 'InstanceInformationList[0].InstanceId' --output text 2>/dev/null | grep -q "$INSTANCE_ID"; then
+              echo "SSM ready"
+              break
+            fi
+            echo "Waiting for SSM... ($i/30)"
+            sleep 10
+          done
+          sleep 5
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "{\"commands\":[\"echo ECS_CLUSTER=$CLUSTER > /etc/ecs/ecs.config\",\"echo ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config\",\"systemctl restart ecs 2>/dev/null || systemctl restart ecs-init 2>/dev/null || true\",\"sleep 10\"]}" \
+            --timeout-seconds 60 \
+            --region $REGION \
+            --query 'Command.CommandId' --output text)
+          for i in {1..12}; do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region $REGION --query 'Status' --output text 2>/dev/null || echo "Pending")
+            # #region agent log
+            echo "::notice::[DEBUG] SSM command status=$STATUS (attempt $i/12)"
+            # #endregion
+            [ "$STATUS" = "Success" ] && echo "ECS agent configured" && break
+            [ "$STATUS" = "Failed" ] && aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region $REGION && exit 1
+            sleep 5
+          done
+
+      - name: Wait for EC2 to register with ECS cluster
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ steps.cluster.outputs.cluster }}"
+          INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
+          # #region agent log
+          echo "::notice::[DEBUG] Verifying cluster exists:"
+          aws ecs describe-clusters --clusters "$CLUSTER" --region $REGION --query 'clusters[0].{status:status,clusterName:clusterName}' --output table 2>/dev/null || echo "Cluster describe failed"
+          echo "::notice::[DEBUG] Container instances in cluster (before wait):"
+          aws ecs list-container-instances --cluster $CLUSTER --region $REGION --output json 2>/dev/null | head -20
+          # #endregion
+          for i in {1..30}; do
+            for ARN in $(aws ecs list-container-instances --cluster $CLUSTER --region $REGION --query 'containerInstanceArns[]' --output text 2>/dev/null); do
+              [ -z "$ARN" ] && continue
+              EC2_ID=$(aws ecs describe-container-instances --cluster $CLUSTER --container-instances $ARN --region $REGION --query 'containerInstances[0].ec2InstanceId' --output text 2>/dev/null || echo "")
+              if [ "$EC2_ID" = "$INSTANCE_ID" ]; then
+                STATUS=$(aws ecs describe-container-instances --cluster $CLUSTER --container-instances $ARN --region $REGION --query 'containerInstances[0].status' --output text)
+                if [ "$STATUS" = "ACTIVE" ]; then
+                  echo "Instance registered with cluster"
+                  exit 0
+                fi
+              fi
+            done
+            # #region agent log
+            if [ $((i % 5)) -eq 0 ]; then
+              echo "::notice::[DEBUG] Iteration $i/30 - container instances:"
+              aws ecs list-container-instances --cluster $CLUSTER --region $REGION --query 'containerInstanceArns' --output text 2>/dev/null || echo "none"
+            fi
+            # #endregion
+            echo "Waiting for ECS registration... ($i/30)"
+            sleep 20
+          done
+          echo "Timeout: instance did not register with cluster."
+          echo "Fix: Add AmazonEC2ContainerServiceforEC2Role to instance profile ${{ vars.EC2_IAM_INSTANCE_PROFILE || 'ec2-ssm-role' }}"
+          exit 1
+
+      - name: Diagnose ECS registration (on failure)
+        if: failure()
+        run: |
+          INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
+          REGION="${{ env.AWS_REGION }}"
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters '{"commands":["cat /etc/ecs/ecs.config 2>/dev/null || echo no-config","systemctl status ecs 2>/dev/null || true","curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/ 2>/dev/null || echo no-role"]}' \
+            --timeout-seconds 30 \
+            --region $REGION \
+            --query 'Command.CommandId' --output text 2>/dev/null) || true
+          sleep 10
+          if [ -n "$CMD_ID" ]; then
+            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --region $REGION 2>/dev/null || true
+          fi
+
+      - name: Register task definition
+        id: taskdef
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          jq \
+            --arg img "${{ env.VLLM_IMAGE }}" \
+            --arg model "${{ env.INFER_MODEL }}" \
+            --arg role "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole" \
+            --arg region "$REGION" \
+            '.containerDefinitions[0].image = $img | .containerDefinitions[0].command = ["--model", $model] | .executionRoleArn = $role | .containerDefinitions[0].logConfiguration.options["awslogs-region"] = $region' \
+            ecs/task-definition.json > /tmp/task-def.json
+          TASK_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/task-def.json --region $REGION --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+
+      - name: Stop existing vLLM tasks
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ steps.cluster.outputs.cluster }}"
+          TASK_DEF="${{ vars.ECS_TASK_DEFINITION || 'vllm-qwen' }}"
+          for ARN in $(aws ecs list-tasks --cluster $CLUSTER --family $TASK_DEF --desired-status RUNNING --region $REGION --query 'taskArns[]' --output text 2>/dev/null); do
+            [ -n "$ARN" ] && [ "$ARN" != "None" ] && aws ecs stop-task --cluster $CLUSTER --task $ARN --region $REGION --query 'task.taskArn' --output text
+          done
+          sleep 10
+
+      - name: Run ECS task
+        id: task
+        env:
+          HF_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ steps.cluster.outputs.cluster }}"
+          TASK_DEF="${{ steps.taskdef.outputs.task_arn }}"
+          if [ -n "$HF_TOKEN" ]; then
+            OVERRIDES=$(jq -n --arg t "$HF_TOKEN" '{containerOverrides:[{name:"vllm",environment:[{name:"HUGGING_FACE_HUB_TOKEN",value:$t}]}]}')
+          else
+            OVERRIDES='{}'
+          fi
+          aws ecs run-task \
+            --cluster $CLUSTER \
+            --task-definition $TASK_DEF \
+            --launch-type EC2 \
+            --overrides "$OVERRIDES" \
+            --region $REGION \
+            --output json > /tmp/run-task.json
+          FAILURES=$(jq -r '.failures // [] | length' /tmp/run-task.json)
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "Run-task placement failed:"
+            jq '.failures' /tmp/run-task.json
+            exit 1
+          fi
+          TASK_ARN=$(jq -r '.tasks[0].taskArn // empty' /tmp/run-task.json)
+          if [ -z "$TASK_ARN" ]; then
+            echo "No task returned from run-task:"
+            cat /tmp/run-task.json
+            exit 1
+          fi
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+
+      - name: Wait for task running
+        id: endpoint
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ steps.cluster.outputs.cluster }}"
+          TASK_ARN=$(echo "${{ steps.task.outputs.task_arn }}" | tr -d '\n\r ')
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "Invalid task ARN"
+            exit 1
+          fi
+          for i in {1..120}; do
+            TASK_JSON=$(aws ecs describe-tasks --cluster $CLUSTER --tasks "$TASK_ARN" --region $REGION --output json)
+            if [ "$(echo "$TASK_JSON" | jq -r '.tasks | length')" = "0" ]; then
+              echo "Task not found (may have been stopped):"
+              echo "$TASK_JSON" | jq .
+              exit 1
+            fi
+            STATUS=$(echo "$TASK_JSON" | jq -r '.tasks[0].lastStatus // "PENDING"')
+            if [ "$STATUS" = "RUNNING" ]; then
+              echo "endpoint=${{ steps.net.outputs.elastic_ip }}" >> $GITHUB_OUTPUT
+              echo "Task running (bridge mode: use instance IP)"
+              exit 0
+            fi
+            if [ "$STATUS" = "STOPPED" ]; then
+              echo "Task stopped unexpectedly"
+              echo "$TASK_JSON" | jq '.tasks[0] | {stoppedReason, stopCode, containers: [.containers[] | {name, exitCode, reason}]}'
+              exit 1
+            fi
+            echo "Waiting for task... ($i/120) status=$STATUS"
+            sleep 10
+          done
+          echo "Timeout waiting for task (status: $STATUS)"
+          echo "$TASK_JSON" | jq '.tasks[0] | {lastStatus, stoppedReason, stopCode, containers: [.containers[]? | {name, exitCode, reason}]}'
+          exit 1
+
+      - name: Output
+        run: |
+          EIP="${{ steps.net.outputs.elastic_ip }}"
+          echo "vLLM API: http://$EIP:8000"
+          echo ""
+          echo "Test models: curl http://$EIP:8000/v1/models"
+          echo "Test chat: curl http://$EIP:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"Qwen/Qwen2.5-7B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'"
